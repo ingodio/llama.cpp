@@ -164,8 +164,6 @@ jobs:
           name: llama-bin-ubuntu-${{ matrix.build }}.tar.gz
 
   ui-build:
-    needs: [check-release, get-version]
+    needs: [check-release]
     if: ${{ needs.check-release.outputs.should_release == 'true' }}
     uses: ./.github/workflows/ui-build.yml
-    with:
-      hf_ui_version: ${{ needs.get-version.outputs.ui_version }}
