@@ -654,6 +654,59 @@ class TQ2_0(__Quant, qtype=GGMLQuantizationType.TQ2_0):
         return (d * qs.astype(np.float32))
 
 
+class Q1_0(__Quant, qtype=GGMLQuantizationType.Q1_0):
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        # sequential sum like the C reference, np.sum uses pairwise summation and can round differently
+        d = np.cumsum(abs(blocks), axis=-1, dtype=np.float32)[..., -1:] / np.float32(cls.block_size)
+        qs = np.packbits(blocks >= 0, axis=-1, bitorder="little")
+
+        d = d.astype(np.float16).view(np.uint8)
+
+        return np.concatenate([d, qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        d, qs = np.hsplit(blocks, [2])
+
+        d = d.view(np.float16).astype(np.float32)
+
+        qs = np.unpackbits(qs, axis=-1, bitorder="little")
+
+        return np.where(qs != 0, d, -d)
+
+
+class Q2_0(__Quant, qtype=GGMLQuantizationType.Q2_0):
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d = abs(blocks).max(axis=-1, keepdims=True)
+        with np.errstate(divide="ignore"):
+            id = np.where(d == 0, 0, 1 / d)
+        qs = (np_roundf(blocks * id) + 1).clip(0, 3).astype(np.uint8)
+
+        qs = qs.reshape((n_blocks, -1, 4)) << np.array([0, 2, 4, 6], dtype=np.uint8)
+        qs = qs[..., 0] | qs[..., 1] | qs[..., 2] | qs[..., 3]
+
+        d = d.astype(np.float16).view(np.uint8)
+
+        return np.concatenate([d, qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d, qs = np.hsplit(blocks, [2])
+
+        d = d.view(np.float16).astype(np.float32)
+
+        qs = qs.reshape((n_blocks, -1, 1)) >> np.array([0, 2, 4, 6], dtype=np.uint8)
+        qs = (qs & 0x03).reshape((n_blocks, -1)).astype(np.int8) - np.int8(1)
+
+        return (d * qs.astype(np.float32))
+
+
 class MXFP4(__Quant, qtype=GGMLQuantizationType.MXFP4):
     # e2m1 values (doubled)
     # ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
@@ -722,29 +775,65 @@ class NVFP4(__Quant, qtype=GGMLQuantizationType.NVFP4):
 
     @staticmethod
     def fp32_to_ue4m3(x: np.ndarray) -> np.ndarray:
-        """Vectorized float32 to unsigned E4M3, matching ggml_fp32_to_ue4m3 in C."""
-        x = np.clip(x, 0.0, 448.0).astype(np.float32)
-        bits = x.view(np.uint32)
-        fp32_exp = ((bits >> 23) & 0xFF).astype(np.int32) - 127
-        fp32_man = ((bits >> 20) & 0x7).astype(np.int32)
-        ue4m3_exp = fp32_exp + 7
+        """Vectorized float32 to unsigned E4M3, matching ggml_fp32_to_ue4m3 in C.
 
-        # Subnormal
-        sub_man = np.clip((x * 512.0 + 0.5).astype(np.int32), 0, 7)
-        sub_result = np.where(sub_man >= 1, sub_man, 0).astype(np.uint8)
+        Round-to-nearest-even. Finite codes use exp field 0..15 with max 0x7E (=448);
+        0x7F is reserved. Values >= 448 saturate to 0x7E.
+        """
+        x = np.asarray(x, dtype=np.float32)
+        out = np.zeros(x.shape, dtype=np.uint8)
 
-        # Normal with rounding
-        round_bit = ((bits >> 19) & 1).astype(np.int32)
-        man = fp32_man + round_bit
-        exp = ue4m3_exp.copy()
-        overflow = man > 7
-        man = np.where(overflow, 0, man)
-        exp = np.where(overflow, exp + 1, exp)
-        normal_result = np.where(exp >= 15, np.uint8(0x7E), ((exp << 3) | man).astype(np.uint8))
+        pos = x > 0.0
+        if not np.any(pos):
+            return out
 
-        return np.where(x <= 0.0, np.uint8(0),
-                        np.where(ue4m3_exp <= 0, sub_result,
-                        np.where(ue4m3_exp >= 15, np.uint8(0x7E), normal_result)))
+        sat = pos & (x >= 448.0)
+        out[sat] = np.uint8(0x7E)
+
+        work = pos & ~sat
+        if not np.any(work):
+            return out
+
+        xv = x[work]
+        bits = xv.view(np.uint32)
+        exp_unbiased = ((bits >> 23) & 0xFF).astype(np.int32) - 127
+        man23 = bits & np.uint32(0x7FFFFF)
+        ue_exp = exp_unbiased + 7
+
+        # Subnormal: man = round_ties_to_even(x * 512); overflow -> 0x08
+        sub = ue_exp <= 0
+        if np.any(sub):
+            scaled = xv[sub] * np.float32(512.0)
+            fl = np.floor(scaled)
+            diff = scaled - fl
+            lo = fl.astype(np.int32)
+            # >0.5 up; <0.5 down; ==0.5 tie-to-even
+            man = np.where(diff > 0.5, lo + 1,
+                  np.where(diff < 0.5, lo,
+                           np.where((lo & 1) != 0, lo + 1, lo)))
+            sub_res = np.where(man > 7, np.uint8(0x08),
+                      np.where(man < 1, np.uint8(0), man.astype(np.uint8)))
+            # write back
+            idx = np.flatnonzero(work)[sub]
+            out.ravel()[idx] = sub_res
+
+        # Normal: top 3 mantissa bits, RNE on lower 20; allow exp==15 man 0..6
+        norm = ~sub
+        if np.any(norm):
+            man = ((man23[norm] >> 20) & np.uint32(7)).astype(np.int32)
+            rest = man23[norm] & np.uint32(0xFFFFF)
+            round_up = (rest > np.uint32(0x80000)) | ((rest == np.uint32(0x80000)) & ((man & 1) != 0))
+            man = man + round_up.astype(np.int32)
+            exp = ue_exp[norm].copy()
+            overflow = man > 7
+            man = np.where(overflow, 0, man)
+            exp = np.where(overflow, exp + 1, exp)
+            sat2 = (exp > 15) | ((exp == 15) & (man > 6))
+            norm_res = np.where(sat2, np.uint8(0x7E), ((exp << 3) | man).astype(np.uint8))
+            idx = np.flatnonzero(work)[norm]
+            out.ravel()[idx] = norm_res
+
+        return out
 
     @classmethod
     def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
